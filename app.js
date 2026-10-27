@@ -1,6 +1,7 @@
 /**
  * app.js — 画面制御
- * 5タブ（作成/返信/求職者/履歴/設定）と、結果・求職者詳細・2つの小窓を操作する。
+ * 4タブ（作成/返信/履歴/設定）と、結果・2つの小窓を操作する。
+ * （求職者の選択・自動登録は「作成/返信」の求職者欄＝M02で行う。一覧タブは非表示。）
  */
 'use strict';
 const $ = (id) => document.getElementById(id);
@@ -8,10 +9,9 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 
 const state = {
   data: null,
-  create: { candidateId: '', candidateName: '指定なし', newName: '', level: '2', sceneId: '' },
-  reply: { candidateId: '', candidateName: '指定なし', newName: '', level: '2' },
+  create: { level: '2', sceneId: '' },
+  reply: { level: '2' },
   result: null,      // { type, historyId, variants, request }
-  pickTarget: 'create',
   history: { page: 0, hasMore: false, items: [] }
 };
 
@@ -50,14 +50,13 @@ async function copyText(text) {
 function showLogin() { $('screen-login').classList.remove('hidden'); $('app').classList.add('hidden'); }
 function showApp() { $('screen-login').classList.add('hidden'); $('app').classList.remove('hidden'); }
 
-const TAB_TITLE = { create: '作成', reply: '返信', candidates: '求職者', history: '履歴', settings: '設定' };
+const TAB_TITLE = { create: '作成', reply: '返信', history: '履歴', settings: '設定' };
 function showTab(name) {
-  ['create', 'reply', 'candidates', 'history', 'settings'].forEach((t) => {
+  ['create', 'reply', 'history', 'settings'].forEach((t) => {
     $('tab-' + t).classList.toggle('hidden', t !== name);
   });
   document.querySelectorAll('.tabbar-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
   $('header-title').textContent = TAB_TITLE[name];
-  if (name === 'candidates') renderCandidateList();
   if (name === 'history') { state.history.page = 0; runHistorySearch(true); }
 }
 
@@ -70,7 +69,6 @@ async function init() {
   bindTabs();
   bindCreate();
   bindReply();
-  bindCandidates();
   bindHistory();
   bindSettings();
   bindModals();
@@ -105,11 +103,9 @@ function applyData() {
   renderLevelButtons('create-levels', 'create');
   renderLevelButtons('reply-levels', 'reply');
   renderSceneButtons();
-  fillStatusFilter();
   fillHistoryLevelFilter();
   fillSceneFilter();
   applySettingsToForm();
-  updateCandidateLabels();
   updateGenerateEnabled();
 }
 
@@ -167,14 +163,27 @@ function renderSceneButtons() {
     const free = scenes.find((s) => s.name === '自由入力');
     if (free) state.create.sceneId = free.id;
   }
-  let lastPhase = '';
+  // フェーズごとにまとめ、チップは折り返して表示（横スクロールしない）
+  const groups = [];
   scenes.forEach((s) => {
-    if (s.phase && s.phase !== lastPhase) { box.appendChild(el('span', 'scene-phase', s.phase)); lastPhase = s.phase; }
-    const b = el('button', 'scene-btn', s.name);
-    b.type = 'button';
-    if (String(state.create.sceneId) === String(s.id)) b.classList.add('active');
-    b.onclick = () => { state.create.sceneId = s.id; renderSceneButtons(); applySceneHint(s); };
-    box.appendChild(b);
+    const phase = s.phase || '';
+    let g = groups.find((x) => x.phase === phase);
+    if (!g) { g = { phase, items: [] }; groups.push(g); }
+    g.items.push(s);
+  });
+  groups.forEach((g) => {
+    const grp = el('div', 'scene-group');
+    if (g.phase) grp.appendChild(el('div', 'scene-phase-head', g.phase));
+    const chips = el('div', 'scene-chips');
+    g.items.forEach((s) => {
+      const b = el('button', 'scene-btn', s.name);
+      b.type = 'button';
+      if (String(state.create.sceneId) === String(s.id)) b.classList.add('active');
+      b.onclick = () => { state.create.sceneId = s.id; renderSceneButtons(); applySceneHint(s); };
+      chips.appendChild(b);
+    });
+    grp.appendChild(chips);
+    box.appendChild(grp);
   });
   const cur = scenes.find((s) => String(s.id) === String(state.create.sceneId));
   if (cur) applySceneHint(cur);
@@ -185,7 +194,6 @@ function applySceneHint(scene) {
 
 /* ============ S02 作成 ============ */
 function bindCreate() {
-  $('create-candidate').onclick = () => openCandidatePicker('create');
   $('create-input').addEventListener('input', () => { Store.set(Store.DRAFT, { input: $('create-input').value }); updateGenerateEnabled(); });
   $('create-fav').onclick = () => openFavorites();
   $('create-generate').onclick = () => doGenerate('create');
@@ -194,19 +202,10 @@ function updateGenerateEnabled() {
   $('create-generate').disabled = $('create-input').value.trim() === '';
   $('reply-generate').disabled = $('reply-received').value.trim() === '';
 }
-function updateCandidateLabels() {
-  $('create-candidate-name').textContent = state.create.candidateName || '指定なし';
-  $('reply-candidate-name').textContent = state.reply.candidateName || '指定なし';
-}
 
 /* ============ S04 返信 ============ */
 function bindReply() {
-  $('reply-candidate').onclick = () => openCandidatePicker('reply');
   $('reply-received').addEventListener('input', updateGenerateEnabled);
-  $('reply-paste').onclick = async () => {
-    try { const t = await navigator.clipboard.readText(); $('reply-received').value = t; updateGenerateEnabled(); }
-    catch (e) { toast('貼り付けできませんでした。手で貼り付けてください'); }
-  };
   $('reply-generate').onclick = () => doGenerate('reply');
 }
 
@@ -214,8 +213,6 @@ function bindReply() {
 function buildGenerateRequest(which) {
   const st = state[which];
   const req = { type: which === 'reply' ? 'reply' : 'create', level: st.level, sceneId: which === 'create' ? state.create.sceneId : '' };
-  if (st.candidateId) req.candidateId = st.candidateId;
-  else if (st.newName) req.newName = st.newName;
   if (which === 'create') req.inputText = $('create-input').value.trim();
   else { req.receivedText = $('reply-received').value.trim(); req.inputText = $('reply-input').value.trim(); }
   return req;
@@ -226,10 +223,6 @@ async function doGenerate(which) {
   try {
     const data = await Api.generate(req);
     hideLoading();
-    if (data.candidate) {
-      state.data.candidates.push(data.candidate);
-      Store.set(Store.BOOTSTRAP, state.data);
-    }
     state.result = { type: req.type, historyId: data.historyId, variants: data.variants, request: req };
     renderResult();
     if (which === 'create') { $('create-input').value = ''; Store.remove(Store.DRAFT); updateGenerateEnabled(); }
@@ -324,12 +317,6 @@ async function doCopy(text, idx) {
   toast('コピーしました');
   // 裏でコピー記録（失敗時はキューへ）
   Api.markCopied(state.result.historyId, state.result.variants[idx].messages.join('\n'));
-  // 最終連絡日を手元のキャッシュにも反映
-  const req = state.result.request;
-  if (req && req.candidateId) {
-    const c = state.data.candidates.find((x) => x.id === req.candidateId);
-    if (c) { c.last_contact_at = nowStr(); Store.set(Store.BOOTSTRAP, state.data); }
-  }
 }
 function regenerate() {
   $('screen-result').classList.add('hidden');
@@ -345,45 +332,6 @@ async function saveVariantAsFavorite(idx) {
     state.data.favorites.push(fav.favorite); Store.set(Store.BOOTSTRAP, state.data);
     toast('お気に入りに追加しました');
   } catch (e) { handleError(e); }
-}
-
-/* ============ M02 求職者選択 ============ */
-function openCandidatePicker(target) {
-  state.pickTarget = target;
-  $('cand-pick-search').value = '';
-  $('cand-pick-new').classList.add('hidden');
-  renderPickList('');
-  $('modal-cand').classList.remove('hidden');
-}
-function renderPickList(q) {
-  const box = $('cand-pick-list'); box.innerHTML = '';
-  const list = (state.data.candidates || []).filter((c) => !q || (c.name || '').indexOf(q) >= 0);
-  list.slice(0, 50).forEach((c) => {
-    const item = el('div', 'list-item');
-    item.innerHTML = '<div class="li-top"><span class="li-name">' + esc(c.name) + '</span><span class="li-badge">Lv' + esc(c.level) + '</span></div><div class="li-sub">' + esc(c.status || '') + '</div>';
-    item.onclick = () => pickCandidate(c);
-    box.appendChild(item);
-  });
-  const newBtn = $('cand-pick-new');
-  if (q && !list.some((c) => c.name === q)) {
-    newBtn.textContent = '「' + q + '」を新しい求職者にする';
-    newBtn.classList.remove('hidden');
-    newBtn.onclick = () => pickNewName(q);
-  } else newBtn.classList.add('hidden');
-}
-function pickCandidate(c) {
-  const st = state[state.pickTarget];
-  st.candidateId = c.id; st.candidateName = c.name; st.newName = '';
-  st.level = String(c.level || st.level);
-  closeModal('modal-cand');
-  renderLevelButtons(state.pickTarget + '-levels', state.pickTarget);
-  updateCandidateLabels();
-}
-function pickNewName(name) {
-  const st = state[state.pickTarget];
-  st.candidateId = ''; st.newName = name; st.candidateName = name + '（新規）';
-  closeModal('modal-cand');
-  updateCandidateLabels();
 }
 
 /* ============ M01 お気に入り ============ */
@@ -423,104 +371,6 @@ async function deleteFav(id) {
     Store.set(Store.BOOTSTRAP, state.data);
     renderFavList($('fav-scene-filter').value);
   } catch (e) { handleError(e); }
-}
-
-/* ============ S05 求職者一覧 ============ */
-function bindCandidates() {
-  $('cand-search').addEventListener('input', renderCandidateList);
-  $('cand-status-filter').addEventListener('change', renderCandidateList);
-  $('cand-add').onclick = () => openCandidateDetail(null);
-}
-function renderCandidateList() {
-  const box = $('cand-list'); box.innerHTML = '';
-  const q = $('cand-search').value.trim();
-  const status = $('cand-status-filter').value;
-  let list = (state.data.candidates || []).filter((c) => (!q || (c.name || '').indexOf(q) >= 0) && (!status || c.status === status));
-  list = list.slice().sort((a, b) => String(b.last_contact_at || '').localeCompare(String(a.last_contact_at || '')));
-  if (!list.length) { box.appendChild(el('p', 'muted small', '該当する求職者がいません')); return; }
-  list.forEach((c) => {
-    const item = el('div', 'list-item');
-    item.innerHTML = '<div class="li-top"><span class="li-name">' + esc(c.name) + '</span><span class="li-badge">Lv' + esc(c.level) + '</span></div>' +
-      '<div class="li-sub">' + esc(c.status || '') + '　最終連絡: ' + esc(c.last_contact_at || '—') + '</div>';
-    item.onclick = () => openCandidateDetail(c);
-    box.appendChild(item);
-  });
-}
-function fillStatusFilter() {
-  const statuses = ['面談前', '求人提案中', '選考中', '内定', '入社', '辞退・休止'];
-  const sel = $('cand-status-filter');
-  sel.innerHTML = '<option value="">すべての状況</option>' + statuses.map((s) => '<option>' + s + '</option>').join('');
-}
-
-/* ============ S06 求職者詳細 ============ */
-const STATUSES = ['面談前', '求人提案中', '選考中', '内定', '入社', '辞退・休止'];
-function openCandidateDetail(c) {
-  const body = $('cd-body'); body.innerHTML = '';
-  const isNew = !c;
-  c = c || { id: '', name: '', call_name: '', level: '2', age: '', experience: '', desired_job: '', status: '面談前', memo: '' };
-  const fields = [
-    ['name', '名前', 'text'], ['call_name', '呼び方', 'text'], ['age', '年齢', 'text'],
-    ['experience', '経験', 'text'], ['desired_job', '希望', 'text'], ['memo', 'メモ', 'textarea']
-  ];
-  const inputs = {};
-  // レベル
-  const lvWrap = el('div', 'cd-field'); lvWrap.appendChild(el('label', null, 'レベル'));
-  const lvSel = el('select'); levelList().forEach((lv) => { const o = el('option', null, 'Lv' + lv.level + ' ' + (lv.label || '')); o.value = lv.level; lvSel.appendChild(o); });
-  lvSel.value = c.level || '2'; lvWrap.appendChild(lvSel); body.appendChild(lvWrap);
-  // 状況
-  const stWrap = el('div', 'cd-field'); stWrap.appendChild(el('label', null, '選考状況'));
-  const stSel = el('select'); STATUSES.forEach((s) => { const o = el('option', null, s); o.value = s; stSel.appendChild(o); });
-  stSel.value = c.status || '面談前'; stWrap.appendChild(stSel); body.appendChild(stWrap);
-  // テキスト項目
-  fields.forEach(([key, label, type]) => {
-    const w = el('div', 'cd-field'); w.appendChild(el('label', null, label));
-    const i = type === 'textarea' ? el('textarea') : el('input');
-    i.value = c[key] || ''; inputs[key] = i; w.appendChild(i); body.appendChild(w);
-  });
-
-  // 操作ボタン（既存のみ）
-  if (!isNew) {
-    const acts = el('div', 'cd-actions');
-    const sendBtn = el('button', 'ghost-btn', 'この人に送る'); sendBtn.type = 'button';
-    sendBtn.onclick = () => { pickForTarget('create', c); closeOverlay('screen-candidate'); showTab('create'); };
-    const replyBtn = el('button', 'ghost-btn', 'この人に返信'); replyBtn.type = 'button';
-    replyBtn.onclick = () => { pickForTarget('reply', c); closeOverlay('screen-candidate'); showTab('reply'); };
-    acts.appendChild(sendBtn); acts.appendChild(replyBtn); body.appendChild(acts);
-
-    body.appendChild(el('label', 'field-label', 'やり取り履歴'));
-    body.appendChild(renderTimeline(c.id));
-  }
-
-  $('cd-save').onclick = async () => {
-    const payload = { id: c.id, level: lvSel.value, status: stSel.value };
-    Object.keys(inputs).forEach((k) => payload[k] = inputs[k].value);
-    if (!payload.name.trim()) { toast('名前を入力してください'); return; }
-    try {
-      const res = await Api.saveCandidate(payload);
-      const i = state.data.candidates.findIndex((x) => x.id === res.candidate.id);
-      if (i >= 0) state.data.candidates[i] = res.candidate; else state.data.candidates.push(res.candidate);
-      Store.set(Store.BOOTSTRAP, state.data);
-      toast('保存しました'); closeOverlay('screen-candidate'); renderCandidateList();
-    } catch (e) { handleError(e); }
-  };
-  $('screen-candidate').classList.remove('hidden');
-}
-function pickForTarget(which, c) {
-  const st = state[which];
-  st.candidateId = c.id; st.candidateName = c.name; st.newName = ''; st.level = String(c.level || '2');
-  renderLevelButtons(which + '-levels', which); updateCandidateLabels();
-}
-function renderTimeline(candidateId) {
-  const wrap = el('div', 'timeline');
-  const items = (state.data.recentHistory || []).filter((h) => String(h.candidate_id) === String(candidateId))
-    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-  if (!items.length) { wrap.appendChild(el('p', 'muted small', 'まだやり取りがありません')); return wrap; }
-  items.forEach((h) => {
-    if (h.received_text) wrap.appendChild(el('div', 'tl-item tl-them', h.received_text));
-    if (h.final_text) wrap.appendChild(el('div', 'tl-item tl-me', h.final_text));
-    wrap.appendChild(el('div', 'tl-date', h.created_at));
-  });
-  return wrap;
 }
 
 /* ============ S07 履歴 ============ */
@@ -625,12 +475,6 @@ function fillSceneFilter() {
 function bindModals() {
   document.querySelectorAll('[data-close]').forEach((b) => { b.onclick = () => closeModal(b.dataset.close); });
   document.querySelectorAll('.modal').forEach((m) => { m.addEventListener('click', (e) => { if (e.target === m) m.classList.add('hidden'); }); });
-  $('cand-pick-search').addEventListener('input', (e) => renderPickList(e.target.value.trim()));
-  $('cand-pick-none').onclick = () => {
-    const st = state[state.pickTarget]; st.candidateId = ''; st.newName = ''; st.candidateName = '指定なし';
-    closeModal('modal-cand'); updateCandidateLabels();
-  };
-  $('cd-back').onclick = () => closeOverlay('screen-candidate');
 }
 function closeModal(id) { $(id).classList.add('hidden'); }
 function closeOverlay(id) { $(id).classList.add('hidden'); }
